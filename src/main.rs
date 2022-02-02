@@ -5,10 +5,15 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use truncrate::TruncateToBoundary;
 use twilight_embed_builder::{EmbedAuthorBuilder, EmbedBuilder};
 use twilight_http::Client as HttpClient;
-use twilight_model::channel::{embed::Embed, thread::AutoArchiveDuration};
+use twilight_model::channel::{
+    embed::{Embed, EmbedField},
+    thread::AutoArchiveDuration,
+};
+use twilight_model::datetime::Timestamp;
 
 type ChannelId = twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>;
 
@@ -16,13 +21,13 @@ lazy_static! {
     static ref DB: sled::Db = sled::Config::new().path(env::var("DB_PATH").unwrap()).use_compression(true).open().unwrap();
     static ref MAIL_STORAGE: sled::Tree = DB.open_tree("storage").unwrap();
     static ref THREADS: sled::Tree = DB.open_tree("threads").unwrap();
-    static ref INBOX_CHANNEL_ID: ChannelId = env::var("INBOX_CHANNEL").ok().and_then(|v| v.parse::<u64>().ok()).and_then(|v| ChannelId::new_checked(v)).unwrap();
+    static ref INBOX_CHANNEL_ID: ChannelId = env::var("INBOX_CHANNEL").ok().and_then(|v| v.parse::<u64>().ok()).and_then(ChannelId::new_checked).unwrap();
     static ref DOMAIN_COLORS: HashMap<String, u32> = {
         if let Ok(domain_string) = env::var("DOMAIN_COLORS") {
             domain_string
-                .split_terminator(",")
+                .split_terminator(',')
                 .filter_map(|domain| {
-                    domain.split_once(":").and_then(|(d, color)| {
+                    domain.split_once(':').and_then(|(d, color)| {
                         u32::from_str_radix(color, 16)
                             .ok()
                             .map(|c| (d.to_owned(), c))
@@ -48,10 +53,31 @@ macro_rules! addr {
     };
 }
 
+macro_rules! render_addr_list {
+    ($e:expr) => {
+        match $e {
+            HeaderValue::Address(a) => a.address.as_ref().map(|v| format!("{}", v)),
+            HeaderValue::AddressList(l) => {
+                let v = l
+                    .into_iter()
+                    .filter_map(|a| a.address.as_ref().map(|v| v.to_string()))
+                    .collect::<Vec<String>>()
+                    .join(",");
+                if !v.is_empty() {
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+}
+
 fn get_addr_color(header: &HeaderValue) -> u32 {
     addr!(header)
         .and_then(|a| a.address.as_ref())
-        .and_then(|v| v.split_once("@"))
+        .and_then(|v| v.split_once('@'))
         .and_then(|(_, rhs)| DOMAIN_COLORS.get(rhs).copied())
         .unwrap_or(0x5275b3)
 }
@@ -63,7 +89,7 @@ fn build_embed(message: &Message) -> Result<Vec<Embed>, Box<dyn Error + Send + S
         .filter_map(|part_id| message.get_text_body(*part_id))
         .map(|s| {
             s.lines()
-                .filter(|v| !v.trim_start().starts_with(">") && !GMAIL_QUOTE_REGEX.is_match(v))
+                .filter(|v| !v.trim_start().starts_with('>') && !GMAIL_QUOTE_REGEX.is_match(v))
                 .collect::<Vec<&str>>()
                 .join("\n")
         })
@@ -73,29 +99,40 @@ fn build_embed(message: &Message) -> Result<Vec<Embed>, Box<dyn Error + Send + S
 
     let mut message_parts: Vec<String> = Vec::new();
 
-    while message_contents.len() > 0 {
+    while !message_contents.is_empty() {
         let (_, idx) = message_contents.slice_indices_at_offset(4096);
         message_parts.push(message_contents.drain(..idx).collect());
     }
 
-    let mut embeds: Vec<Embed> = Vec::new();
+    let mut starting_embed = EmbedBuilder::new()
+    .author(
+        EmbedAuthorBuilder::new(format!(
+            "{} to {}",
+            addr!(message.get_from())
+                .and_then(|v| v.address.as_ref())
+                .map(|v| v.to_string())
+                .unwrap_or(String::from("unknown address")),
+            render_addr_list!(message.get_to()).unwrap_or(String::from("unknown address"))
+        ))
+        .build(),
+    )
+    .color(color)
+    .timestamp(message.get_date().and_then(|v| Timestamp::parse(&v.to_iso8601()).ok()).unwrap_or_else(|| {
+        Timestamp::from_secs(SystemTime::now().duration_since(UNIX_EPOCH).expect("what did you do to your system clock? i cannot get duration from the unix epoch").as_secs() as i64).expect("failed to parse the current date into a discord timestamp")
+    }))
+    .title(message.get_subject().unwrap())
+    .description(message_parts.remove(0))
+    .build()?;
 
-    embeds.push(
-        EmbedBuilder::new()
-            .author(
-                EmbedAuthorBuilder::new(format!(
-                    "{}",
-                    addr!(message.get_from())
-                        .and_then(|v| v.address.as_ref())
-                        .unwrap()
-                ))
-                .build(),
-            )
-            .color(color)
-            .title(message.get_subject().unwrap())
-            .description(message_parts.remove(0))
-            .build()?,
-    );
+    if let Some(cc) = render_addr_list!(message.get_cc()) {
+        starting_embed.fields.push(EmbedField {
+            inline: true,
+            name: "cc:".to_owned(),
+            value: cc,
+        });
+    }
+
+    let mut embeds: Vec<Embed> = vec![starting_embed];
 
     for text in message_parts {
         embeds.push(EmbedBuilder::new().color(color).description(text).build()?);
@@ -189,7 +226,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut bytes = Vec::with_capacity(request.body_length().unwrap_or(100));
         request.as_reader().read_to_end(&mut bytes).unwrap();
 
-        if bytes.len() > 0 {
+        if !bytes.is_empty() {
             tokio::task::spawn(send_email(Arc::clone(&http), bytes));
         }
 

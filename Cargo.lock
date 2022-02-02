@@ -449,6 +449,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mai"
+version = "0.1.0"
+dependencies = [
+ "lazy_static",
+ "mail-parser",
+ "regex",
+ "sled",
+ "tiny_http",
+ "tokio",
+ "truncrate",
+ "twilight-embed-builder",
+ "twilight-http",
+ "twilight-model",
+]
+
+[[package]]
 name = "mail-parser"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -844,22 +860,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "sinsbox"
-version = "0.1.0"
-dependencies = [
- "lazy_static",
- "mail-parser",
- "regex",
- "sled",
- "tiny_http",
- "tokio",
- "truncrate",
- "twilight-embed-builder",
- "twilight-http",
- "twilight-model",
 ]
 
 [[package]]
