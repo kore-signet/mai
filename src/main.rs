@@ -1,3 +1,4 @@
+use futures_util::StreamExt;
 use lazy_static::lazy_static;
 use mail_parser::*;
 use regex::Regex;
@@ -8,20 +9,25 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use truncrate::TruncateToBoundary;
 use twilight_embed_builder::{EmbedAuthorBuilder, EmbedBuilder};
+use twilight_gateway::{Event, EventTypeFlags, Intents, Shard};
 use twilight_http::Client as HttpClient;
 use twilight_model::channel::{
     embed::{Embed, EmbedField},
     thread::AutoArchiveDuration,
 };
 use twilight_model::datetime::Timestamp;
+use twilight_model::id::marker::*;
+use twilight_model::id::Id as TwilightId;
 
-type ChannelId = twilight_model::id::Id<twilight_model::id::marker::ChannelMarker>;
+type ChannelId = TwilightId<ChannelMarker>;
+type RoleId = TwilightId<RoleMarker>;
 
 lazy_static! {
     static ref DB: sled::Db = sled::Config::new().path(env::var("DB_PATH").unwrap()).use_compression(true).open().unwrap();
     static ref MAIL_STORAGE: sled::Tree = DB.open_tree("storage").unwrap();
     static ref THREADS: sled::Tree = DB.open_tree("threads").unwrap();
-    static ref INBOX_CHANNEL_ID: ChannelId = env::var("INBOX_CHANNEL").ok().and_then(|v| v.parse::<u64>().ok()).and_then(ChannelId::new_checked).unwrap();
+    static ref INBOX_CHANNEL_ID: ChannelId = env::var("INBOX_CHANNEL").ok().and_then(|v| v.parse::<ChannelId>().ok()).expect("please specify an inbox channel id");
+    static ref MANAGER_ROLE_IDS: Vec<RoleId> = env::var("MANAGER_ROLES").expect("please specify ids for roles with permission to execute management commands").split(',').map(|v| v.parse::<RoleId>().expect("invalid role id")).collect();
     static ref DOMAIN_COLORS: HashMap<String, u32> = {
         if let Ok(domain_string) = env::var("DOMAIN_COLORS") {
             domain_string
@@ -219,18 +225,97 @@ async fn send_email(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let token = env::var("DISCORD_TOKEN")?;
-    let http = Arc::new(HttpClient::new(token));
+    let http = Arc::new(HttpClient::new(token.clone()));
 
+    let discord_task = tokio::task::spawn(listen_discord(Arc::clone(&http), token));
+
+    tokio::try_join!(
+        tokio::task::spawn(listen_http(Arc::clone(&http))),
+        discord_task
+    )?;
+
+    Ok(())
+}
+
+async fn listen_http(http: Arc<HttpClient>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let server = tiny_http::Server::http("0.0.0.0:8010").unwrap();
     for mut request in server.incoming_requests() {
         let mut bytes = Vec::with_capacity(request.body_length().unwrap_or(100));
         request.as_reader().read_to_end(&mut bytes).unwrap();
 
         if !bytes.is_empty() {
-            tokio::task::spawn(send_email(Arc::clone(&http), bytes));
+            send_email(Arc::clone(&http), bytes).await?;
         }
 
         request.respond(tiny_http::Response::empty(204i16)).unwrap();
+    }
+
+    Ok(())
+}
+
+async fn listen_discord(
+    http: Arc<HttpClient>,
+    token: String,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let event_types = EventTypeFlags::MESSAGE_CREATE;
+
+    let (shard, mut events) = Shard::builder(token, Intents::GUILD_MESSAGES)
+        .event_types(event_types)
+        .build();
+
+    shard.start().await?;
+
+    while let Some(event) = events.next().await {
+        if let Event::MessageCreate(message) = event {
+            if let Some(member) = &message.member {
+                if member.roles.iter().any(|r| MANAGER_ROLE_IDS.contains(r)) {
+                    if message.content.starts_with("$mai add_email") {
+                        let args: Vec<&str> = message.content.split_whitespace().collect();
+                        if args.len() != 4 {
+                            http.create_message(message.channel_id).content("wrong number of arguments - usage is $mai add_email <email id> <thread id>")?.exec().await?;
+                            continue;
+                        }
+
+                        if let Ok(thread_id) = args[3].parse::<ChannelId>() {
+                            THREADS.insert(args[2].as_bytes(), &thread_id.get().to_be_bytes())?;
+                            http.create_message(message.channel_id)
+                                .content("mapping created")?
+                                .exec()
+                                .await?;
+                        } else {
+                            http.create_message(message.channel_id)
+                                .content("invalid thread id")?
+                                .exec()
+                                .await?;
+                        }
+                    } else if message.content.starts_with("$mai inspect_db") {
+                        let mut db_state: HashMap<u64, Vec<String>> = HashMap::new();
+                        for (k, v) in THREADS.iter().flatten() {
+                            db_state
+                                .entry(u64::from_be_bytes(v.as_ref().try_into().unwrap()))
+                                .or_default()
+                                .push(String::from_utf8(k.to_vec()).unwrap());
+                        }
+
+                        let mut msg = String::new();
+                        for (k, v) in db_state {
+                            msg += &format!("thread <#{}>:\n```", k);
+                            for id in v {
+                                msg += &format!("- {}\n", id);
+                            }
+                            msg += "```";
+                        }
+
+                        if !msg.is_empty() {
+                            http.create_message(message.channel_id)
+                                .content(msg.truncate_to_byte_offset(2000))?
+                                .exec()
+                                .await?;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
