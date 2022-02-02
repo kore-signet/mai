@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use lazy_static::lazy_static;
 use mail_parser::*;
@@ -6,7 +7,6 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use truncrate::TruncateToBoundary;
 use twilight_embed_builder::{EmbedAuthorBuilder, EmbedBuilder};
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard};
@@ -111,24 +111,32 @@ fn build_embed(message: &Message) -> Result<Vec<Embed>, Box<dyn Error + Send + S
     }
 
     let mut starting_embed = EmbedBuilder::new()
-    .author(
-        EmbedAuthorBuilder::new(format!(
-            "{} to {}",
-            addr!(message.get_from())
-                .and_then(|v| v.address.as_ref())
-                .map(|v| v.to_string())
-                .unwrap_or(String::from("unknown address")),
-            render_addr_list!(message.get_to()).unwrap_or(String::from("unknown address"))
-        ))
-        .build(),
-    )
-    .color(color)
-    .timestamp(message.get_date().and_then(|v| Timestamp::parse(&v.to_iso8601()).ok()).unwrap_or_else(|| {
-        Timestamp::from_secs(SystemTime::now().duration_since(UNIX_EPOCH).expect("what did you do to your system clock? i cannot get duration from the unix epoch").as_secs() as i64).expect("failed to parse the current date into a discord timestamp")
-    }))
-    .title(message.get_subject().unwrap())
-    .description(message_parts.remove(0))
-    .build()?;
+        .author(
+            EmbedAuthorBuilder::new(format!(
+                "{} to {}",
+                addr!(message.get_from())
+                    .and_then(|v| v.address.as_ref())
+                    .map(|v| v.to_string())
+                    .unwrap_or(String::from("unknown address")),
+                render_addr_list!(message.get_to()).unwrap_or(String::from("unknown address"))
+            ))
+            .build(),
+        )
+        .color(color)
+        .timestamp(
+            message
+                .get_date()
+                .and_then(|v| {
+                    Timestamp::from_secs(
+                        v.to_iso8601().parse::<DateTime<Utc>>().unwrap().timestamp(),
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| Timestamp::from_secs(Utc::now().timestamp()).unwrap()),
+        )
+        .title(message.get_subject().unwrap())
+        .description(message_parts.remove(0))
+        .build()?;
 
     if let Some(cc) = render_addr_list!(message.get_cc()) {
         starting_embed.fields.push(EmbedField {
