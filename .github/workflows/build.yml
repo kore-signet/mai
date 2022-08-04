@@ -29,5 +29,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/alisww/mai:latest
-            ghcr.io/alisww/mai:${{ github.sha }}
+            ghcr.io/emily-signet/mai:latest
+            ghcr.io/emily-signet/mai:${{ github.sha }}
